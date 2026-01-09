@@ -76,6 +76,12 @@ In addition, we have the following custom APIs:
     - Jina and Cohere's APIs are very similar; Jina's includes extra information in the rerank endpoint's response.
     - Only applicable to [cross-encoder models](../models/pooling_models.md).
 
+## Admin Control Plane
+
+vLLM provides an optional **Admin Control Plane** for production operations (health checks, draining, monitoring) on a separate port.
+
+For detailed documentation, see [Admin API](admin_api.md).
+
 ## Chat Template
 
 In order for the language model to support chat protocol, vLLM requires the model to include

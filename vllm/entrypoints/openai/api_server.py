@@ -33,6 +33,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 import vllm.envs as envs
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import EngineClient
+from vllm.entrypoints.admin_server import build_admin_app
 from vllm.entrypoints.anthropic.protocol import (
     AnthropicError,
     AnthropicErrorResponse,
@@ -1349,6 +1350,23 @@ async def run_server_worker(
 
         await init_app_state(engine_client, app.state, args)
 
+        if args.enable_admin_api:
+            admin_app = build_admin_app(args)
+            admin_app.state.engine_client = engine_client
+            # Initialize admin app state with necessary components
+            if hasattr(app.state, "openai_serving_models"):
+                admin_app.state.openai_serving_models = app.state.openai_serving_models
+            
+            admin_uvicorn_kwargs = {
+                "host": args.admin_host,
+                "port": args.admin_port,
+                "log_level": args.uvicorn_log_level,
+                "access_log": not args.disable_uvicorn_access_log,
+            }
+        else:
+             admin_app = None
+             admin_uvicorn_kwargs = None
+
         logger.info(
             "Starting vLLM API server %d on %s",
             engine_client.vllm_config.parallel_config._api_process_rank,
@@ -1357,6 +1375,8 @@ async def run_server_worker(
         shutdown_task = await serve_http(
             app,
             sock=sock,
+            admin_app=admin_app,
+            admin_uvicorn_kwargs=admin_uvicorn_kwargs,
             enable_ssl_refresh=args.enable_ssl_refresh,
             host=args.host,
             port=args.port,

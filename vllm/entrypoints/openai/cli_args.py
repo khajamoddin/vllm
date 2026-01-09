@@ -209,6 +209,12 @@ class FrontendArgs:
     Enable offline FastAPI documentation for air-gapped environments.
     Uses vendored static assets bundled with vLLM.
     """
+    enable_admin_api: bool = False
+    """Enable the Admin API server."""
+    admin_host: str = "localhost"
+    """Host for the Admin API server. Defaults to localhost for security."""
+    admin_port: int = 8001
+    """Port for the Admin API server."""
 
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:

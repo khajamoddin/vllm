@@ -27,6 +27,10 @@ logger = init_logger(__name__)
 async def serve_http(
     app: FastAPI,
     sock: socket.socket | None,
+    # New arguments for admin API
+    admin_app: FastAPI | None = None,
+    admin_uvicorn_kwargs: dict[str, Any] | None = None,
+    # Existing argument
     enable_ssl_refresh: bool = False,
     **uvicorn_kwargs: Any,
 ):
@@ -44,6 +48,15 @@ async def serve_http(
             continue
 
         logger.info("Route: %s, Methods: %s", path, ", ".join(methods))
+
+    if admin_app:
+        logger.info("Available admin routes are:")
+        for route in admin_app.routes:
+            methods = getattr(route, "methods", None)
+            path = getattr(route, "path", None)
+            if methods is None or path is None:
+                continue
+            logger.info("Admin Route: %s, Methods: %s", path, ", ".join(methods))
 
     # Extract header limit options if present
     h11_max_incomplete_event_size = uvicorn_kwargs.pop(
@@ -65,10 +78,39 @@ async def serve_http(
     server = uvicorn.Server(config)
     _add_shutdown_handlers(app, server)
 
+    admin_server = None
+    if admin_app and admin_uvicorn_kwargs:
+        # We generally use the same limits for admin app for consistency,
+        # or defaults.
+        admin_config = uvicorn.Config(
+            admin_app,
+            h11_max_incomplete_event_size=h11_max_incomplete_event_size,
+            h11_max_header_count=h11_max_header_count,
+            **admin_uvicorn_kwargs,
+        )
+        admin_config.load()
+        admin_server = uvicorn.Server(admin_config)
+        # We might want minimal shutdown handlers for admin too, or just rely on main
+        # But if admin server throws errors, we want to catch them? 
+        # For now, we don't add specific shutdown handlers linking back to engine 
+        # because admin operations (like read-only) shouldn't crash the engine.
+
     loop = asyncio.get_running_loop()
 
-    watchdog_task = loop.create_task(watchdog_loop(server, app.state.engine_client))
+    # Watchdog monitors the engine. If engine dies, it sets server.should_exit = True
+    # We should update it to also stop admin_server.
+    servers_to_stop = [server]
+    if admin_server:
+        servers_to_stop.append(admin_server)
+        
+    watchdog_task = loop.create_task(
+        watchdog_loop(servers_to_stop, app.state.engine_client)
+    )
+    
     server_task = loop.create_task(server.serve(sockets=[sock] if sock else None))
+    admin_server_task = None
+    if admin_server:
+        admin_server_task = loop.create_task(admin_server.serve())
 
     ssl_cert_refresher = (
         None
@@ -84,6 +126,8 @@ async def serve_http(
     def signal_handler() -> None:
         # prevents the uvicorn signal handler to exit early
         server_task.cancel()
+        if admin_server_task:
+            admin_server_task.cancel()
         watchdog_task.cancel()
         if ssl_cert_refresher:
             ssl_cert_refresher.stop()
@@ -96,24 +140,32 @@ async def serve_http(
 
     try:
         await server_task
+        if admin_server_task:
+            await admin_server_task
         return dummy_shutdown()
     except asyncio.CancelledError:
         port = uvicorn_kwargs["port"]
         process = find_process_using_port(port)
         if process is not None:
-            logger.warning(
+             logger.warning(
                 "port %s is used by process %s launched with command:\n%s",
                 port,
                 process,
                 " ".join(process.cmdline()),
             )
-        logger.info("Shutting down FastAPI HTTP server.")
-        return server.shutdown()
+        
+        shutdown_coros = [server.shutdown()]
+        if admin_server:
+             shutdown_coros.append(admin_server.shutdown())
+        
+        logger.info("Shutting down FastAPI HTTP servers.")
+        await asyncio.gather(*shutdown_coros)
+        return dummy_shutdown()
     finally:
         watchdog_task.cancel()
 
 
-async def watchdog_loop(server: uvicorn.Server, engine: EngineClient):
+async def watchdog_loop(server: uvicorn.Server | list[uvicorn.Server], engine: EngineClient):
     """
     # Watchdog task that runs in the background, checking
     # for error state in the engine. Needed to trigger shutdown
@@ -125,7 +177,7 @@ async def watchdog_loop(server: uvicorn.Server, engine: EngineClient):
         terminate_if_errored(server, engine)
 
 
-def terminate_if_errored(server: uvicorn.Server, engine: EngineClient):
+def terminate_if_errored(server: uvicorn.Server | list[uvicorn.Server], engine: EngineClient):
     """
     See discussions here on shutting down a uvicorn server
     https://github.com/encode/uvicorn/discussions/1103
@@ -135,7 +187,11 @@ def terminate_if_errored(server: uvicorn.Server, engine: EngineClient):
     """
     engine_errored = engine.errored and not engine.is_running
     if not envs.VLLM_KEEP_ALIVE_ON_ENGINE_DEATH and engine_errored:
-        server.should_exit = True
+        if isinstance(server, list):
+            for s in server:
+                s.should_exit = True
+        else:
+            server.should_exit = True
 
 
 def _add_shutdown_handlers(app: FastAPI, server: uvicorn.Server) -> None:
